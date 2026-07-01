@@ -1,176 +1,197 @@
 #include "MainApp.hpp"
+
 #include <esp_log.h>
 
-static const char* TAG = "MainApp";
+namespace
+{
+    constexpr char kLogTag[] = "MainApp";
+}
 
 // ============================================================
 //  INIT
-//  Appelé une seule fois depuis setup().
+//  Appele une seule fois depuis setup().
 //  Initialise les bus, les drivers, la PSRAM et les services.
 // ============================================================
-Status MainApp::init() {
-    ESP_LOGI(TAG, "=== YAMP — demarrage ===");
+Status MainApp::init()
+{
+    ESP_LOGI(kLogTag, "=== YAMP - demarrage ===");
 
-    // --- Bus I2C (Wire.h) — utilisé par INA237 ---------------
-    // Wire.begin() appelé ici, les drivers utilisent Wire directement
+    // Bus I2C utilise par INA237.
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(I2C_FREQ_HZ);
-    ESP_LOGI(TAG, "Bus I2C demarre (SDA=%d SCL=%d @ %u Hz)",
-             PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ_HZ);
+    ESP_LOGI(kLogTag,
+             "Bus I2C demarre (SDA=%d SCL=%d @ %u Hz)",
+             PIN_I2C_SDA,
+             PIN_I2C_SCL,
+             I2C_FREQ_HZ);
 
-    // --- IHM -------------------------------------------------
-    m_led.init();
-    m_buzzer.init();
-    m_button.init();
+    status_led_.init();
+    buzzer_.init();
+    boot_button_.init();
 
-    // --- PSRAM -----------------------------------------------
-    if (!PSRAMManager::isAvailable()) {
-        ESP_LOGW(TAG, "PSRAM non detectee — log desactive");
-    } else {
+    if (!PSRAMManager::isAvailable())
+    {
+        ESP_LOGW(kLogTag, "PSRAM non detectee - log desactive");
+    }
+    else
+    {
         PSRAMManager::logInfo();
-        if (!m_ringBuffer.init()) {
-            ESP_LOGW(TAG, "Ring buffer non initialise");
+
+        if (!ring_buffer_.init())
+        {
+            ESP_LOGW(kLogTag, "Ring buffer non initialise");
         }
     }
 
-    // --- Config (flash NVS + seuils) -------------------------
-    if (m_config.init() != Status::OK) {
-        ESP_LOGW(TAG, "Echec lecture flash — seuils par defaut");
+    if (config_service_.init() != Status::OK)
+    {
+        ESP_LOGW(kLogTag, "Echec lecture flash - seuils par defaut");
     }
 
-    // --- Capteurs (INA237 via Wire, TMP126 via SPI) ----------
-    Status stMonitor = m_monitoring.init();
-    if (stMonitor != Status::OK) {
-        ESP_LOGE(TAG, "Echec init capteurs → etat CRITICAL");
-        m_state = AgvState::CRITICAL;
+    const Status monitoring_status = monitoring_service_.init();
+    if (monitoring_status != Status::OK)
+    {
+        ESP_LOGE(kLogTag, "Echec init capteurs - etat CRITICAL");
+        current_state_ = AgvState::CRITICAL;
         updateHmi();
         return Status::ERROR;
     }
 
-    // --- BLE -------------------------------------------------
-    m_ble.init();
+    ble_manager_.init();
 
-    // --- Etat initial ----------------------------------------
-    m_state = AgvState::NORMAL;
-    m_buzzer.setPattern(BuzzerPattern::SUCCESS_BEEP);
+    current_state_ = AgvState::NORMAL;
+    buzzer_.setPattern(BuzzerPattern::SUCCESS_BEEP);
     updateHmi();
 
-    ESP_LOGI(TAG, "Init OK → etat NORMAL");
+    ESP_LOGI(kLogTag, "Init OK - etat NORMAL");
     return Status::OK;
 }
 
 // ============================================================
-//  PROCESS — appelé dans loop()
-//  Cadencé à APP_LOOP_PERIOD_MS sans delay().
+//  PROCESS
+//  Appele par loop(). Cadencement sans delay().
 // ============================================================
-void MainApp::process() {
-    uint32_t now = millis();
-    if (now - m_lastLoopMs < APP_LOOP_PERIOD_MS) {
-        m_buzzer.update(); // toujours mis à jour (pattern non bloquant)
+void MainApp::process()
+{
+    const uint32_t current_time_ms = millis();
+
+    if ((current_time_ms - last_loop_time_ms_) < APP_LOOP_PERIOD_MS)
+    {
+        buzzer_.update();
         return;
     }
-    m_lastLoopMs = now;
 
-    bool bootPressed = m_button.isBootPressed();
+    last_loop_time_ms_ = current_time_ms;
 
-    // ---- Machine à états ------------------------------------
-    switch (m_state) {
+    const bool is_boot_button_pressed = boot_button_.isBootPressed();
 
+    switch (current_state_)
+    {
         case AgvState::INIT:
-            // Ne devrait pas arriver ici (init() gère la transition)
-            if (init() != Status::OK) {
-                m_state = AgvState::CRITICAL;
+            if (init() != Status::OK)
+            {
+                current_state_ = AgvState::CRITICAL;
             }
             break;
 
         case AgvState::NORMAL:
-        {
-            m_meas = m_monitoring.acquire();
-            AgvState next = m_alarm.evaluate(m_state, m_meas);
-            if (next != m_state) {
-                m_eventLog.log(next, m_meas, stateToStr(next));
-                m_state = next;
-            }
-            if (bootPressed) { m_state = AgvState::INIT; }
-            break;
-        }
-
         case AgvState::WARNING:
-        {
-            m_meas = m_monitoring.acquire();
-            AgvState next = m_alarm.evaluate(m_state, m_meas);
-            if (next != m_state) {
-                m_eventLog.log(next, m_meas, stateToStr(next));
-                m_state = next;
-            }
-            if (bootPressed) { m_state = AgvState::INIT; }
+            processNominalState(is_boot_button_pressed);
             break;
-        }
 
         case AgvState::CRITICAL:
             triggerSafetyShutdown();
-            m_eventLog.log(AgvState::SAFE_SHUTDOWN, m_meas, "Safety shutdown");
-            m_state = AgvState::SAFE_SHUTDOWN;
+            event_log_service_.log(AgvState::SAFE_SHUTDOWN,
+                                   current_measurement_,
+                                   "Safety shutdown");
+            current_state_ = AgvState::SAFE_SHUTDOWN;
             break;
 
         case AgvState::SAFE_SHUTDOWN:
-            // Figé jusqu'au reset manuel
-            if (bootPressed) {
-                ESP_LOGI(TAG, "Reset manuel → retour INIT");
-                m_buzzer.stop();
-                m_state = AgvState::INIT;
-                (void)init();
+            if (is_boot_button_pressed)
+            {
+                ESP_LOGI(kLogTag, "Reset manuel - retour INIT");
+                buzzer_.stop();
+                current_state_ = AgvState::INIT;
+                static_cast<void>(init());
             }
             break;
 
         default:
-            // MISRA : défense contre corruption mémoire de l'état
-            ESP_LOGE(TAG, "Etat FSM inconnu (%d) → CRITICAL",
-                     static_cast<int>(m_state));
-            m_state = AgvState::CRITICAL;
+            ESP_LOGE(kLogTag,
+                     "Etat FSM inconnu (%d) - CRITICAL",
+                     static_cast<int>(current_state_));
+            current_state_ = AgvState::CRITICAL;
             break;
     }
 
-    // --- Mise à jour IHM + BLE après transition d'état -------
     updateHmi();
-    m_ble.notify(m_meas.temperature_degC, m_meas.current_A,
-                 m_meas.voltage_V, m_state);
+    ble_manager_.notify(current_measurement_.temperature_degC,
+                        current_measurement_.current_A,
+                        current_measurement_.voltage_V,
+                        current_state_);
 
-    m_buzzer.update();
+    buzzer_.update();
 }
 
 // ============================================================
-//  UPDATE HMI — LED + Buzzer selon l'état courant
+//  PROCESS NOMINAL STATE
+//  Commun aux etats NORMAL et WARNING.
 // ============================================================
-void MainApp::updateHmi() {
-    switch (m_state) {
+void MainApp::processNominalState(const bool is_boot_button_pressed)
+{
+    current_measurement_ = monitoring_service_.acquire();
+
+    const AgvState next_state = alarm_service_.evaluate(current_state_,
+                                                        current_measurement_);
+
+    if (next_state != current_state_)
+    {
+        event_log_service_.log(next_state,
+                               current_measurement_,
+                               stateToString(next_state));
+        current_state_ = next_state;
+    }
+
+    if (is_boot_button_pressed)
+    {
+        current_state_ = AgvState::INIT;
+    }
+}
+
+// ============================================================
+//  UPDATE HMI
+//  LED et buzzer selon l'etat courant.
+// ============================================================
+void MainApp::updateHmi()
+{
+    switch (current_state_)
+    {
         case AgvState::INIT:
-            m_led.setOff();
+            status_led_.setOff();
             break;
 
         case AgvState::NORMAL:
-            m_led.setGreen();
-            // buzzer OFF (SUCCESS_BEEP se termine seul via update())
+            status_led_.setGreen();
             break;
 
         case AgvState::WARNING:
-            m_led.setOrange();           // rouge + verte = orange
-            m_buzzer.setPattern(BuzzerPattern::WARNING_SLOW);
+            status_led_.setOrange();
+            buzzer_.setPattern(BuzzerPattern::WARNING_SLOW);
             break;
 
         case AgvState::CRITICAL:
-            m_led.setRed();
-            m_buzzer.setPattern(BuzzerPattern::CRITICAL_START);
+            status_led_.setRed();
+            buzzer_.setPattern(BuzzerPattern::CRITICAL_START);
             break;
 
         case AgvState::SAFE_SHUTDOWN:
-            m_led.setRed();
-            // buzzer continue (CRITICAL_BEEP géré automatiquement)
+            status_led_.setRed();
             break;
 
         default:
-            m_led.setRed();
-            m_buzzer.setPattern(BuzzerPattern::CRITICAL_START);
+            status_led_.setRed();
+            buzzer_.setPattern(BuzzerPattern::CRITICAL_START);
             break;
     }
 }
@@ -179,19 +200,43 @@ void MainApp::updateHmi() {
 //  SAFETY SHUTDOWN
 //  Point d'extension : couper le relais de puissance ici.
 // ============================================================
-void MainApp::triggerSafetyShutdown() {
-    ESP_LOGE(TAG, "SAFETY SHUTDOWN déclenché !");
+void MainApp::triggerSafetyShutdown()
+{
+    ESP_LOGE(kLogTag, "SAFETY SHUTDOWN declenche !");
     // Exemple : digitalWrite(PIN_RELAY_POWER, LOW);
-    // (ajouter la broche dans HardwareConfig.hpp si nécessaire)
+    // Ajouter la broche dans HardwareConfig.hpp si necessaire.
 }
 
-const char* MainApp::stateToStr(AgvState s) const {
-    switch (s) {
-        case AgvState::INIT:          return "INIT";
-        case AgvState::NORMAL:        return "NORMAL";
-        case AgvState::WARNING:       return "WARNING";
-        case AgvState::CRITICAL:      return "CRITICAL";
-        case AgvState::SAFE_SHUTDOWN: return "SAFE_SHUTDOWN";
-        default:                      return "UNKNOWN";
+const char* MainApp::stateToString(const AgvState state)
+{
+    const char* state_name = "UNKNOWN";
+
+    switch (state)
+    {
+        case AgvState::INIT:
+            state_name = "INIT";
+            break;
+
+        case AgvState::NORMAL:
+            state_name = "NORMAL";
+            break;
+
+        case AgvState::WARNING:
+            state_name = "WARNING";
+            break;
+
+        case AgvState::CRITICAL:
+            state_name = "CRITICAL";
+            break;
+
+        case AgvState::SAFE_SHUTDOWN:
+            state_name = "SAFE_SHUTDOWN";
+            break;
+
+        default:
+            state_name = "UNKNOWN";
+            break;
     }
+
+    return state_name;
 }

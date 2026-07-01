@@ -1,9 +1,11 @@
 #pragma once
+
 #include <Arduino.h>
+
 #include "config/SystemConfig.hpp"
 #include "config/AppConfig.hpp"
 
-// Couche MID — matériel
+// Couche MID - materiel
 #include "mid/hal/sensors/INA237Driver.hpp"
 #include "mid/hal/sensors/TMP126Driver.hpp"
 #include "mid/hal/ihm/LED.hpp"
@@ -12,66 +14,50 @@
 #include "mid/memory/RingBuffer.hpp"
 #include "mid/memory/FlashStorage.hpp"
 
-// Couche MID — communication
+// Couche MID - communication
 #include "mid/ble/BLEManager.hpp"
 
-// Couche APP — services
+// Couche APP - services
 #include "app/services/MonitoringService.hpp"
 #include "app/services/AlarmService.hpp"
 #include "app/services/EventLoggingService.hpp"
 #include "app/services/ConfigService.hpp"
 
-// ============================================================
-//  MainApp.hpp — Couche APP
-//
-//  Orchestre la machine à états (FSM) et tous les services.
-//  Inspiré de l'EnergyManager fourni — adapté Arduino/PlatformIO.
-//
-//  FSM :
-//    INIT  ──OK──► NORMAL ──seuil W──► WARNING ──seuil C──► CRITICAL
-//                    ▲                   │ (hystérésis)         │
-//                    └───────────────────┘                      ▼
-//                  (reset)                               SAFE_SHUTDOWN
-//                    ▲                                          │
-//                    └──────────────────────────────────────────┘ (reset)
-// ============================================================
-
-class MainApp {
+class MainApp final
+{
 public:
-    // setup() doit appeler init() UNE SEULE FOIS
     Status init();
-
-    // loop() appelle process() à chaque cycle
     void process();
 
 private:
-    // ---- Instances drivers (ownership ici) ------------------
-    INA237Driver  m_ina237;
-    TMP126Driver  m_tmp126;
-    LED           m_led;
-    Buzzer        m_buzzer;
-    Button        m_button;
-    RingBuffer    m_ringBuffer;
-    FlashStorage  m_flash;
-    BLEManager    m_ble;
-
-    // ---- Services applicatifs -------------------------------
-    MonitoringService    m_monitoring {m_ina237, m_tmp126};
-    AlarmService         m_alarm;
-    EventLoggingService  m_eventLog   {m_ringBuffer};
-    ConfigService        m_config     {m_flash, m_alarm};
-
-    // ---- État FSM -------------------------------------------
-    AgvState m_state = AgvState::INIT;
-
-    // ---- Mesures courantes ----------------------------------
-    Measurement m_meas;
-
-    // ---- Timing boucle principale ---------------------------
-    uint32_t m_lastLoopMs = 0U;
-
-    // ---- Méthodes privées -----------------------------------
+    void processNominalState(bool is_boot_button_pressed);
     void updateHmi();
     void triggerSafetyShutdown();
-    const char* stateToStr(AgvState s) const;
+
+    static const char* stateToString(AgvState state);
+
+    // Instances drivers : ownership dans MainApp.
+    INA237Driver ina237_driver_;
+    TMP126Driver tmp126_driver_;
+    LED status_led_;
+    Buzzer buzzer_;
+    Button boot_button_;
+    RingBuffer ring_buffer_;
+    FlashStorage flash_storage_;
+    BLEManager ble_manager_;
+
+    // Services applicatifs.
+    MonitoringService monitoring_service_{ina237_driver_, tmp126_driver_};
+    AlarmService alarm_service_;
+    EventLoggingService event_log_service_{ring_buffer_};
+    ConfigService config_service_{flash_storage_, alarm_service_};
+
+    // Etat courant de la FSM.
+    AgvState current_state_ = AgvState::INIT;
+
+    // Derniere mesure acquise.
+    Measurement current_measurement_{};
+
+    // Cadencement de la boucle principale.
+    uint32_t last_loop_time_ms_ = 0U;
 };

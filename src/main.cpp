@@ -1,17 +1,18 @@
 #include <Arduino.h>
+
 #include "MainApp.hpp"
 
-// Instance unique de l'application
-static MainApp app;
+namespace
+{
+    MainApp g_main_app;
+}
 
 void setup()
 {
-    // Initialisation de l'application
-    (void)app.init();
+    g_main_app.init();
 }
 
 void loop()
 {
-    // Boucle principale non bloquante
-    app.process();
+    g_main_app.process();
 }
